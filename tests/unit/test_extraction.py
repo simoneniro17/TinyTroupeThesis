@@ -7,9 +7,10 @@ import logging
 logger = logging.getLogger("tinytroupe")
 
 import sys
-sys.path.append('../../tinytroupe/')
-sys.path.append('../../')
-sys.path.append('..')
+# Insert paths at the beginning of sys.path (position 0)
+sys.path.insert(0, '..')
+sys.path.insert(0, '../../')
+sys.path.insert(0, '../../tinytroupe/')
 
 from testing_utils import *
 from tinytroupe.extraction import ArtifactExporter, Normalizer
@@ -108,6 +109,12 @@ def test_normalizer():
         assert normalized_concept is not None, "The normalized concept should not be None."
         logger.debug(f"Normalized concept: {bucket} -> {normalized_concept}")
         print(f"Normalized concept: {bucket} -> {normalized_concept}")
+
+        # Semantic verification: ensure normalized concepts are semantically related to original concepts
+        original_concepts_str = ", ".join(bucket)
+        normalized_concepts_str = ", ".join(normalized_concept)
+        combined_text = f"Original concepts: {original_concepts_str}\nNormalized concepts: {normalized_concepts_str}"
+        assert proposition_holds(combined_text + " - The normalized concepts are semantically related to or categorically similar to the original concepts")
 
         next_cache_size = len(normalizer.normalizing_map.keys())
 

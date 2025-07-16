@@ -39,10 +39,16 @@ class Action(BaseModel):
 
 class CognitiveState(BaseModel):
     goals: str
+    context: list[str]
     attention: str
     emotions: str
 
 class CognitiveActionModel(BaseModel):
+    action: Action
+    cognitive_state: CognitiveState
+
+class CognitiveActionModelWithReasoning(BaseModel):
+    reasoning: str
     action: Action
     cognitive_state: CognitiveState
 
@@ -51,10 +57,10 @@ class CognitiveActionModel(BaseModel):
 # Exposed API
 ###########################################################################
 # from. grounding ... ---> not exposing this, clients should not need to know about detailed grounding mechanisms
-from .memory import SemanticMemory, EpisodicMemory
+from .memory import SemanticMemory, EpisodicMemory, EpisodicConsolidator, ReflectionConsolidator
 from .mental_faculty import CustomMentalFaculty, RecallFaculty, FilesAndWebGroundingFaculty, TinyToolUse
 from .tiny_person import TinyPerson
 
-__all__ = ["SemanticMemory", "EpisodicMemory", 
+__all__ = ["SemanticMemory", "EpisodicMemory", "EpisodicConsolidator", "ReflectionConsolidator",
            "CustomMentalFaculty", "RecallFaculty", "FilesAndWebGroundingFaculty", "TinyToolUse",
            "TinyPerson"]
