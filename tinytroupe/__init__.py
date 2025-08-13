@@ -230,6 +230,8 @@ def get_config(key, override_value=None):
 
 if config["OpenAI"].get("API_TYPE") == "azure":
     from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
+elif config["OpenAI"].get("API_TYPE") == "ollama":
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 else:
     from llama_index.embeddings.openai import OpenAIEmbedding
 
@@ -248,6 +250,12 @@ if config["OpenAI"].get("API_TYPE") == "azure":
                                                         deployment_name=default["embedding_model"],
                                                         api_version=default["azure_embedding_model_api_version"],
                                                         embed_batch_size=10)
+elif config["OpenAI"].get("API_TYPE") == "ollama":
+    # Use HuggingFace embedding for Ollama since we can't pass Ollama embedding directly to llama_index
+    llamaindex_openai_embed_model = HuggingFaceEmbedding(
+        model_name="BAAI/bge-small-en-v1.5",  # Use a small but effective model
+        embed_batch_size=10
+    )
 else:
     llamaindex_openai_embed_model = OpenAIEmbedding(model=default["embedding_model"], embed_batch_size=10)
 Settings.embed_model = llamaindex_openai_embed_model

@@ -5,6 +5,8 @@ import time
 import pickle
 import logging
 import configparser
+import requests
+import json
 from typing import Union
 
 
@@ -290,6 +292,18 @@ class OpenAIClient:
         model (str): The name of the model to use for encoding the string.
         """
         try:
+            # For Ollama models, use a simple estimation since tiktoken won't work
+            if (config["OpenAI"].get("API_TYPE") == "ollama" or 
+                (not any(m in model.lower() for m in ["gpt", "openai", "azure", "o1", "o3", "ppo"]) and 
+                 any(m in model.lower() for m in ["llama", "mistral", "qwen", "mixtral", "phi", "gemma", "ollama"]))):
+                
+                # For Ollama models, estimate tokens based on a simple 4 chars per token rule
+                logger.debug(f"Using estimated token count for Ollama model: {model}")
+                
+                total_chars = sum(len(message.get("content", "")) for message in messages)
+                # Roughly 4 characters per token for most languages
+                return max(1, int(total_chars / 4))
+                
             try:
                 encoding = tiktoken.encoding_for_model(model)
             except KeyError:
@@ -316,9 +330,10 @@ class OpenAIClient:
                 logger.debug("Token count: gpt-4 may update over time. Returning num tokens assuming gpt-4-0613.")
                 return self._count_tokens(messages, model="gpt-4-0613")
             else:
-                raise NotImplementedError(
-                    f"""_count_tokens() is not implemented for model {model}. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens."""
-                )
+                # For unknown models, use a simple estimation
+                logger.debug(f"Using cl100k_base encoding for unknown model: {model}")
+                tokens_per_message = 3
+                tokens_per_name = 1
             
             num_tokens = 0
             for message in messages:
@@ -331,8 +346,13 @@ class OpenAIClient:
             return num_tokens
         
         except Exception as e:
-            logger.error(f"Error counting tokens: {e}")
-            return None
+            # If token counting fails, estimate based on character count
+            logger.warning(f"Error counting tokens with tiktoken: {e}")
+            logger.warning("Using character-based estimation instead")
+            
+            total_chars = sum(len(message.get("content", "")) for message in messages)
+            # Roughly 4 characters per token for most languages
+            return max(1, int(total_chars / 4))
 
     def _save_cache(self):
         """
@@ -410,6 +430,353 @@ class AzureClient(OpenAIClient):
                 api_version = config["OpenAI"]["AZURE_API_VERSION"],
                 azure_ad_token_provider=token_provider
             )
+
+class OllamaClient(OpenAIClient):
+    """
+    A client for interacting with Ollama API.
+    """
+    
+    def __init__(self, cache_api_calls=default["cache_api_calls"], cache_file_name=default["cache_file_name"]) -> None:
+        logger.debug("Initializing OllamaClient")
+        super().__init__(cache_api_calls, cache_file_name)
+        
+    def _setup_from_config(self):
+        """
+        Sets up the Ollama API configurations for this client.
+        Since Ollama doesn't use the OpenAI client library, we just store the base URL.
+        """
+        self.base_url = config["OpenAI"].get("OLLAMA_BASE_URL", "http://localhost:11434")
+        logger.info(f"Using Ollama API at {self.base_url}")
+        # We don't set self.client here as we're using direct HTTP requests
+    
+    def _raw_model_call(self, model, chat_api_params):
+        """
+        Calls the Ollama API with the given parameters.
+        """
+        # Extract parameters needed for Ollama API
+        messages = chat_api_params.get("messages", [])
+        
+        logger.debug(f"Using Ollama model: {model}")
+        
+        # First try using the /api/chat endpoint
+        try:
+            # If we have multiple messages, try the chat API
+            if len(messages) > 1:
+                return self._try_chat_api(model, messages, chat_api_params)
+            else:
+                # For a single message, use the generate API which is more widely supported
+                return self._try_generate_api(model, messages, chat_api_params)
+        except Exception as e:
+            logger.error(f"Error in primary API call method: {e}")
+            # Fall back to other method if the first one failed
+            try:
+                if len(messages) > 1:
+                    return self._try_generate_api(model, messages, chat_api_params)
+                else:
+                    return self._try_chat_api(model, messages, chat_api_params)
+            except Exception as fallback_e:
+                logger.error(f"Error in fallback API call method: {fallback_e}")
+                raise NonTerminalError(f"Ollama API error: All methods failed")
+    
+    def _try_chat_api(self, model, messages, chat_api_params):
+        """Try using the Ollama chat API endpoint"""
+        # Prepare the request payload for Ollama chat API
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {}
+        }
+        
+        # Map OpenAI parameters to Ollama parameters
+        if "temperature" in chat_api_params:
+            payload["options"]["temperature"] = chat_api_params["temperature"]
+        
+        if "max_tokens" in chat_api_params:
+            payload["options"]["num_predict"] = chat_api_params["max_tokens"]
+        
+        if "top_p" in chat_api_params:
+            payload["options"]["top_p"] = chat_api_params["top_p"]
+        
+        # Send the request to Ollama
+        logger.debug(f"Sending request to Ollama chat API: {self.base_url}/api/chat")
+        
+        response = requests.post(
+            f"{self.base_url}/api/chat",
+            json=payload,
+            timeout=chat_api_params.get("timeout", 60)
+        )
+        
+        response.raise_for_status()
+        
+        try:
+            result = response.json()
+            return self._convert_to_openai_format(result)
+        except Exception as json_error:
+            logger.warning(f"Failed to parse JSON response: {json_error}")
+            # Create a response with the raw text
+            return self._create_raw_text_response(response.text)
+    
+    def _try_generate_api(self, model, messages, chat_api_params):
+        """Try using the Ollama generate API endpoint which is more commonly supported"""
+        # Extract the text from the last user message
+        last_message = None
+        system_prompt = None
+        
+        for msg in messages:
+            if msg["role"] == "user":
+                last_message = msg["content"]
+            elif msg["role"] == "system":
+                system_prompt = msg["content"]
+        
+        if not last_message:
+            last_message = "Hello"  # Fallback
+        
+        # Combine system prompt with user message if both exist
+        prompt = last_message
+        if system_prompt:
+            prompt = f"System: {system_prompt}\n\nUser: {last_message}"
+        
+        # Prepare payload for generate API
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {}
+        }
+        
+        # Map OpenAI parameters to Ollama parameters
+        if "temperature" in chat_api_params:
+            payload["options"]["temperature"] = chat_api_params["temperature"]
+        
+        if "max_tokens" in chat_api_params:
+            payload["options"]["num_predict"] = chat_api_params["max_tokens"]
+        
+        if "top_p" in chat_api_params:
+            payload["options"]["top_p"] = chat_api_params["top_p"]
+        
+        # Send the request to Ollama
+        logger.debug(f"Sending request to Ollama generate API: {self.base_url}/api/generate")
+        
+        response = requests.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+            timeout=chat_api_params.get("timeout", 60)
+        )
+        
+        response.raise_for_status()
+        
+        try:
+            result = response.json()
+            # Convert generate response to chat format
+            chat_result = {
+                "message": {
+                    "content": result.get("response", ""),
+                    "role": "assistant"
+                }
+            }
+            return self._convert_to_openai_format(chat_result)
+        except Exception as json_error:
+            logger.warning(f"Failed to parse JSON response: {json_error}")
+            # Create a response with the raw text
+            return self._create_raw_text_response(response.text)
+    
+    def _convert_to_openai_format(self, ollama_response):
+        """
+        Converts Ollama API response format to OpenAI format.
+        """
+        # Create a response object that mimics the OpenAI response structure
+        openai_format = type('obj', (object,), {
+            "choices": [
+                type('obj', (object,), {
+                    "message": type('obj', (object,), {
+                        "content": ollama_response.get("message", {}).get("content", ""),
+                        "role": ollama_response.get("message", {}).get("role", "assistant"),
+                        "to_dict": lambda: {
+                            "content": ollama_response.get("message", {}).get("content", ""),
+                            "role": ollama_response.get("message", {}).get("role", "assistant")
+                        }
+                    })
+                })
+            ]
+        })
+        
+        return openai_format
+        
+    def _create_raw_text_response(self, raw_text):
+        """
+        Creates an OpenAI format response object from raw text when JSON parsing fails.
+        """
+        # Create a response object that mimics the OpenAI response structure
+        openai_format = type('obj', (object,), {
+            "choices": [
+                type('obj', (object,), {
+                    "message": type('obj', (object,), {
+                        "content": raw_text,
+                        "role": "assistant",
+                        "to_dict": lambda: {
+                            "content": raw_text,
+                            "role": "assistant"
+                        }
+                    })
+                })
+            ]
+        })
+        
+        return openai_format
+    
+    def _raw_embedding_model_call(self, text, model):
+        """
+        Calls the Ollama API to get the embedding of the given text.
+        """
+        # For embeddings, we'll try to be more resilient by falling back to a simpler format
+        # and using a compatible model name if possible
+        
+        # Try first with original model
+        try:
+            return self._try_embedding_call(text, model)
+        except Exception as e:
+            logger.warning(f"Error getting embeddings with model {model}: {e}")
+            
+            # Fall back to a few common embedding models available in Ollama
+            fallback_models = ["nomic-embed-text", "all-minilm", "bge-small"]
+            
+            for fallback_model in fallback_models:
+                try:
+                    logger.info(f"Trying fallback embedding model: {fallback_model}")
+                    return self._try_embedding_call(text, fallback_model)
+                except Exception as fallback_e:
+                    logger.warning(f"Error with fallback model {fallback_model}: {fallback_e}")
+            
+            # If all fallbacks fail, create a dummy embedding as last resort
+            logger.error("All embedding attempts failed, returning dummy embedding")
+            import numpy as np
+            dummy_embedding = np.random.normal(0, 1, 384).tolist()  # Standard size for small embeddings
+            
+            # Create a response object that mimics the OpenAI response structure
+            return type('obj', (object,), {
+                "data": [
+                    type('obj', (object,), {
+                        "embedding": dummy_embedding
+                    })
+                ]
+            })
+    
+    def _try_embedding_call(self, text, model):
+        """Try to get an embedding from Ollama with a specific model"""
+        payload = {
+            "model": model,
+            "prompt": text
+        }
+        
+        response = requests.post(
+            f"{self.base_url}/api/embeddings",
+            json=payload,
+            timeout=60
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        # Create a response object that mimics the OpenAI response structure
+        return type('obj', (object,), {
+            "data": [
+                type('obj', (object,), {
+                    "embedding": result.get("embedding", [])
+                })
+            ]
+        })
+            
+class OllamaClient(OpenAIClient):
+    """
+    A client for interacting with Ollama API.
+    This client implements the same interface as OpenAIClient but uses the Ollama API instead.
+    """
+
+    def __init__(self, cache_api_calls=default["cache_api_calls"], cache_file_name=default["cache_file_name"]) -> None:
+        logger.debug("Initializing OllamaClient")
+        super().__init__(cache_api_calls, cache_file_name)
+        self.base_url = config["OpenAI"].get("OLLAMA_BASE_URL", "http://localhost:11434")
+    
+    def _setup_from_config(self):
+        """
+        Sets up the Ollama API configurations for this client.
+        Unlike OpenAI client, Ollama doesn't need an API key and uses a simple REST API.
+        """
+        logger.info(f"Using Ollama API at {self.base_url}")
+        # No client to create as we'll use requests directly
+        pass
+    
+    def _raw_model_call(self, model, chat_api_params):
+        """
+        Calls the Ollama API with the given parameters.
+        """
+        # Ollama API expects a different format compared to OpenAI
+        ollama_params = {
+            "model": model,
+            "messages": chat_api_params.get("messages", []),
+            "stream": False,
+        }
+        
+        # Optionally add temperature if specified
+        if "temperature" in chat_api_params and chat_api_params["temperature"] is not None:
+            ollama_params["temperature"] = chat_api_params["temperature"]
+            
+        # Map max_tokens to num_predict for Ollama
+        if "max_tokens" in chat_api_params and chat_api_params["max_tokens"] is not None:
+            ollama_params["num_predict"] = chat_api_params["max_tokens"]
+            
+        # Make the API call
+        logger.debug(f"Sending request to Ollama API: {ollama_params}")
+        response = requests.post(f"{self.base_url}/api/chat", json=ollama_params)
+        
+        if response.status_code != 200:
+            logger.error(f"Error from Ollama API: {response.status_code} {response.text}")
+            raise Exception(f"Ollama API error: {response.status_code} {response.text}")
+            
+        # Convert Ollama response to OpenAI-like format
+        result = response.json()
+        
+        # Create a structure similar to OpenAI's response
+        openai_like_response = type('OllamaResponse', (), {
+            'choices': [
+                type('Choice', (), {
+                    'message': type('Message', (), {
+                        'to_dict': lambda: {"role": "assistant", "content": result.get("message", {}).get("content", "")}
+                    })
+                })
+            ]
+        })
+        
+        return openai_like_response
+        
+    def _raw_embedding_model_call(self, text, model):
+        """
+        Gets embeddings using Ollama API.
+        """
+        params = {
+            "model": model,
+            "prompt": text
+        }
+        
+        response = requests.post(f"{self.base_url}/api/embeddings", json=params)
+        
+        if response.status_code != 200:
+            logger.error(f"Error from Ollama API: {response.status_code} {response.text}")
+            raise Exception(f"Ollama API error: {response.status_code} {response.text}")
+            
+        result = response.json()
+        
+        # Create a structure similar to OpenAI's response
+        openai_like_response = type('OllamaEmbeddingResponse', (), {
+            'data': [
+                type('EmbeddingData', (), {
+                    'embedding': result.get("embedding", [])
+                })
+            ]
+        })
+        
+        return openai_like_response
     
 
 ###########################################################################
@@ -499,9 +866,10 @@ def force_api_cache(cache_api_calls, cache_file_name=default["cache_file_name"])
     for client in _api_type_to_client.values():
         client.set_api_cache(cache_api_calls, cache_file_name)
 
-# default client
+# default clients
 register_client("openai", OpenAIClient())
 register_client("azure", AzureClient())
+register_client("ollama", OllamaClient())
 
 
 

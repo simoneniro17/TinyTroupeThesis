@@ -241,6 +241,35 @@ class EpisodicMemory(TinyMemory):
         
         # the current episode buffer, which is used to store messages during an episode
         self.episodic_buffer = []
+        
+    def _preprocess_value_for_storage(self, value: Any) -> Any:
+        """
+        Preprocesses a value before storing it in episodic memory.
+        Ensures that JSON strings are properly converted to Python dictionaries.
+        
+        Args:
+            value (Any): The value to preprocess.
+            
+        Returns:
+            Any: The preprocessed value.
+        """
+        # If value is already a dict, continue with parent class preprocessing
+        if isinstance(value, dict):
+            return value
+        
+        # If value is a string that might be JSON, try to parse it
+        if isinstance(value, str):
+            try:
+                # Use our improved extract_json function
+                parsed_value = utils.llm.extract_json(value)
+                if parsed_value:  # If successful parsing
+                    logger.debug(f"Successfully parsed JSON string in episodic memory: {parsed_value}")
+                    return parsed_value
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON string in episodic memory: {e}")
+                
+        # Fall back to original value if parsing fails
+        return value
 
 
     def commit_episode(self):

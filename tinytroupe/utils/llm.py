@@ -2,6 +2,7 @@ import re
 import json
 import ast
 import os
+import sys
 import chevron
 from typing import Collection, Dict, List, Union
 from pydantic import BaseModel
@@ -10,6 +11,13 @@ import functools
 import inspect
 import pprint
 import textwrap
+
+# Optional json5 import - used for more lenient JSON parsing if available
+try:
+    import json5
+    HAS_JSON5 = True
+except ImportError:
+    HAS_JSON5 = False
 
 from tinytroupe import utils
 from tinytroupe.utils import logger
@@ -844,15 +852,17 @@ def llm(enable_json_output_format:bool=True, enable_justification_step:bool=True
 ################################################################################
 def extract_json(text: str) -> dict:
     """
-    Extracts a JSON object from a string, ignoring: any text before the first 
-    opening curly brace; and any Markdown opening (```json) or closing(```) tags.
+    Extracts a JSON object from a string, handling:
+    - Any text before the first opening curly brace
+    - Markdown opening (```json) or closing(```) tags
+    - Code blocks in Ollama responses
+    - Fixing common JSON formatting errors
     """
     try:
         logger.debug(f"Extracting JSON from text: {text}")
 
         # if it already is a dictionary or list, return it
         if isinstance(text, dict) or isinstance(text, list):
-
             # validate that all the internal contents are indeed JSON-like
             try:
                 json.dumps(text)
@@ -863,39 +873,102 @@ def extract_json(text: str) -> dict:
             logger.debug(f"Text is already a dictionary. Returning it.")
             return text
 
-        filtered_text = ""
+        # Handle markdown code blocks (especially for Ollama responses)
+        # Remove markdown code block delimiters like ```json and ```
+        text = re.sub(r'```(?:json|javascript|js)?\s*', '', text)
+        text = re.sub(r'\s*```', '', text)
+
+        filtered_text = text
 
         # remove any text before the first opening curly or square braces, using regex. Leave the braces.
-        filtered_text = re.sub(r'^.*?({|\[)', r'\1', text, flags=re.DOTALL)
+        filtered_text = re.sub(r'^.*?({|\[)', r'\1', filtered_text, flags=re.DOTALL)
 
         # remove any trailing text after the LAST closing curly or square braces, using regex. Leave the braces.
-        filtered_text  =  re.sub(r'(}|\])(?!.*(\]|\})).*$', r'\1', filtered_text, flags=re.DOTALL)
+        filtered_text = re.sub(r'(}|\])(?!.*(\]|\})).*$', r'\1', filtered_text, flags=re.DOTALL)
+        
+        # Fix common JSON formatting issues that can cause parsing errors
         
         # remove invalid escape sequences, which show up sometimes
         filtered_text = re.sub("\\'", "'", filtered_text) # replace \' with just '
         filtered_text = re.sub("\\,", ",", filtered_text)
-
-        # parse the final JSON in a robust manner, to account for potentially messy LLM outputs
-        try:
-            # First try standard JSON parsing
-            # use strict=False to correctly parse new lines, tabs, etc.
-            parsed = json.loads(filtered_text, strict=False)
-        except json.JSONDecodeError:
-            # If JSON parsing fails, try ast.literal_eval which accepts single quotes
-            try:
-                parsed = ast.literal_eval(filtered_text)
-                logger.debug("Used ast.literal_eval as fallback for single-quoted JSON-like text")
-            except:
-                # If both fail, try converting single quotes to double quotes and parse again
-                # Replace single-quoted keys and values with double quotes, without using look-behind
-                # This will match single-quoted strings that are keys or values in JSON-like structures
-                # It may not be perfect for all edge cases, but works for most LLM outputs
-                converted_text = re.sub(r"'([^']*)'", r'"\1"', filtered_text)
-                parsed = json.loads(converted_text, strict=False)
-                logger.debug("Converted single quotes to double quotes before parsing")
         
-        # return the parsed JSON object
-        return parsed
+        # Fix common JSON formatting errors
+        # 1. Remove trailing commas in arrays and objects (common issue with LLM-generated JSON)
+        filtered_text = re.sub(r',\s*([\]}])', r'\1', filtered_text)
+        
+        # 2. Fix missing commas between elements
+        filtered_text = re.sub(r'}\s*{', '},{', filtered_text)
+        filtered_text = re.sub(r'"\s*{', '",{', filtered_text)
+        filtered_text = re.sub(r'}\s*"', '},"', filtered_text)
+        filtered_text = re.sub(r'"\s*\[', '",[', filtered_text)
+        filtered_text = re.sub(r']\s*"', '],"', filtered_text)
+        
+        # 3. Fix issues with unescaped quotes in string values
+        # Replace all instances of unescaped quotes within string values with escaped quotes
+        # This is a complex problem, so we do a best-effort approach
+        def fix_unescaped_quotes(match):
+            content = match.group(1)
+            # Replace unescaped double quotes with escaped ones, but avoid over-escaping
+            fixed = re.sub(r'(?<!\\)"', r'\"', content)
+            return f'"{fixed}"'
+        
+        filtered_text = re.sub(r'"(.*?)"', fix_unescaped_quotes, filtered_text)
+        
+        # parse the final JSON in a robust manner, to account for potentially messy LLM outputs
+        parsing_attempts = [
+            # First try standard JSON parsing
+            lambda text: json.loads(text, strict=False),
+            
+            # Try with ast.literal_eval which accepts single quotes
+            lambda text: ast.literal_eval(text),
+            
+            # Try converting single quotes to double quotes and parse again
+            lambda text: json.loads(re.sub(r"'([^']*)'", r'"\1"', text), strict=False),
+            
+            # Try a more aggressive cleaning approach
+            lambda text: json.loads(re.sub(r'([{,])\s*([^"\'\s{][^:]*?):\s*', r'\1"\2":', text), strict=False),
+            
+            # Last resort: try to use a JSON5 parser if available
+            lambda text: json5.loads(text) if HAS_JSON5 else None
+        ]
+        
+        for i, attempt in enumerate(parsing_attempts):
+            try:
+                if i == 4 and not HAS_JSON5:  # Skip JSON5 if not available
+                    continue
+                    
+                parsed = attempt(filtered_text)
+                if i > 0:
+                    logger.debug(f"JSON parsing succeeded using fallback method {i}")
+                return parsed
+            except Exception as e:
+                if i == len(parsing_attempts) - 1 or (i == 3 and not HAS_JSON5):
+                    logger.error(f"Failed to parse JSON after all attempts: {e}")
+                    # As a last resort, try to manually fix the JSON
+                    try:
+                        # Try to locate the specific error position and fix it
+                        if isinstance(e, json.JSONDecodeError):
+                            line, col = e.lineno, e.colno
+                            logger.debug(f"Attempting manual fix at line {line}, column {col}")
+                            lines = filtered_text.split('\n')
+                            if line <= len(lines):
+                                prob_line = lines[line-1]
+                                # Try simple fixes like adding missing commas
+                                if "Expecting ',' delimiter" in str(e):
+                                    if col > 0 and col <= len(prob_line):
+                                        fixed_line = prob_line[:col] + "," + prob_line[col:]
+                                        lines[line-1] = fixed_line
+                                        fixed_text = '\n'.join(lines)
+                                        try:
+                                            return json.loads(fixed_text, strict=False)
+                                        except:
+                                            pass
+                    except:
+                        pass
+                    return {}
+        
+        # Should never reach here, but just in case
+        return {}
     
     except Exception as e:
         logger.error(f"Error occurred while extracting JSON: {e}. Input text: {text}. Filtered text: {filtered_text}")
